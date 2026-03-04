@@ -1,5 +1,6 @@
 """Async JSON-RPC 2.0 HTTP client for communicating with BalatroBot."""
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -25,15 +26,34 @@ class BalatroClient:
     host: str = "127.0.0.1"
     port: int = 12346
     timeout: float = 30.0
+    logger: logging.Logger | None = None
 
     _client: httpx.AsyncClient | None = field(default=None, init=False, repr=False)
     _request_id: int = field(default=0, init=False, repr=False)
+
+    async def _log_request(self, request: httpx.Request) -> None:
+        """Log outgoing HTTP request."""
+        if self.logger:
+            self.logger.debug(f"→ {request.method} {request.url}")
+
+    async def _log_response(self, response: httpx.Response) -> None:
+        """Log incoming HTTP response."""
+        if self.logger:
+            elapsed = response.elapsed.total_seconds() if response.elapsed else 0
+            self.logger.debug(
+                f"← {response.request.method} {response.request.url} - "
+                f"{response.status_code} ({elapsed:.3f}s)"
+            )
 
     async def __aenter__(self) -> "BalatroClient":
         """Create and configure the async HTTP client."""
         self._client = httpx.AsyncClient(
             base_url=f"http://{self.host}:{self.port}",
             timeout=self.timeout,
+            event_hooks={
+                "request": [self._log_request],
+                "response": [self._log_response],
+            },
         )
         return self
 

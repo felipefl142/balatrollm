@@ -22,8 +22,6 @@ from .config import Config, Task, get_model_config
 from .llm import LLMClient, LLMClientError, LLMTimeoutError
 from .strategy import StrategyManager
 
-logger = logging.getLogger(__name__)
-
 
 class BotError(Exception):
     """Base exception for bot errors."""
@@ -44,6 +42,10 @@ class Bot:
         self._balatro: BalatroClient | None = None
         self._llm: LLMClient | None = None
         self._collector: Collector | None = None
+        self._file_handler: logging.FileHandler | None = None
+
+        # Instance-specific logger to avoid contamination in parallel execution
+        self._logger = logging.getLogger(f"balatrollm.bot.{task.seed}")
 
         self._last_error_msg: str | None = None
         self._last_failed_msg: str | None = None
@@ -60,19 +62,25 @@ class Bot:
         self._balatro = BalatroClient(
             host=self.config.host,
             port=self.port,
+            logger=self._logger,
         )
         await self._balatro.__aenter__()
 
         self._llm = LLMClient(
             base_url=self.config.base_url,
             api_key=self.config.api_key or "",
+            logger=self._logger,
         )
         await self._llm.__aenter__()
 
         return self
 
     async def __aexit__(self, *_: Any) -> None:
-        """Clean up all clients."""
+        """Clean up all clients and file handler."""
+        if self._file_handler is not None:
+            self._logger.removeHandler(self._file_handler)
+            self._file_handler.close()
+            self._file_handler = None
         if self._llm is not None:
             await self._llm.__aexit__(None, None, None)
             self._llm = None
@@ -81,25 +89,21 @@ class Bot:
             self._balatro = None
 
     def _setup_file_logging(self) -> None:
-        """Redirect logging to file in run directory."""
+        """Set up file logging for this bot instance."""
         if self._collector is None:
             return
 
-        root_logger = logging.getLogger()
-        root_logger.setLevel(logging.INFO)
-        for handler in root_logger.handlers[:]:
-            root_logger.removeHandler(handler)
-
         log_file = self._collector.run_dir / "run.log"
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(
+        self._file_handler = logging.FileHandler(log_file)
+        self._file_handler.setLevel(logging.INFO)
+        self._file_handler.setFormatter(
             logging.Formatter(
                 "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",
             )
         )
-        root_logger.addHandler(file_handler)
+        self._logger.addHandler(self._file_handler)
+        self._logger.setLevel(logging.INFO)
 
     async def _wait_for_menu(self, timeout: float = 10.0) -> None:
         """Wait for game to be in MENU state."""
@@ -110,10 +114,10 @@ class Bot:
             try:
                 gamestate = await self._balatro.call("gamestate")
                 if gamestate.get("state", "") == "MENU":
-                    logger.debug("Confirmed MENU state")
+                    self._logger.debug("Confirmed MENU state")
                     return
             except Exception as e:
-                logger.debug(f"Gamestate check failed: {e}")
+                self._logger.debug(f"Gamestate check failed: {e}")
             await asyncio.sleep(0.5)
 
         self._finish_reason = "connection_abort"
@@ -142,8 +146,8 @@ class Bot:
         self._collector = Collector(self.task, runs_dir)
         self._setup_file_logging()
 
-        logger.info("Starting game")
-        logger.info(f"Run data will be saved to: {self._collector.run_dir}")
+        self._logger.info("Starting game")
+        self._logger.info(f"Run data will be saved to: {self._collector.run_dir}")
 
         try:
             await self._balatro.call("menu")
@@ -158,20 +162,20 @@ class Bot:
             )
             await self._run_game_loop(gamestate)
         except BotError:
-            logger.error("Game ended due to bot error")
+            self._logger.error("Game ended due to bot error")
             raise
         except Exception as e:
             self._finish_reason = "unexpected_error"
-            logger.exception("Unexpected error occurred during gameplay")
+            self._logger.exception("Unexpected error occurred during gameplay")
             raise BotError(f"Unexpected error: {e}") from e
         finally:
             if self._collector:
                 try:
                     reason: FinishReason = self._finish_reason or "unexpected_error"
                     self._collector.write_stats(reason)
-                    logger.info("Stats written")
+                    self._logger.info("Stats written")
                 except Exception as e:
-                    logger.debug(
+                    self._logger.debug(
                         f"Could not write stats (normal if run failed early): {e}"
                     )
 
@@ -188,11 +192,11 @@ class Bot:
         while True:
             if gamestate.get("won", False):
                 self._finish_reason = "won"
-                logger.info("Game won! Waiting for GAME_OVER state...")
+                self._logger.info("Game won! Waiting for GAME_OVER state...")
                 break
 
             current_state = gamestate.get("state", "")
-            logger.info(f"State: {current_state}")
+            self._logger.info(f"State: {current_state}")
 
             await asyncio.sleep(0.5)
             await self._balatro.call("gamestate")
@@ -208,7 +212,7 @@ class Bot:
                     gamestate = await self._balatro.call("select")
                 case "GAME_OVER":
                     self._finish_reason = "lost"
-                    logger.info("Game over!")
+                    self._logger.info("Game over!")
                     break
                 case _:
                     await asyncio.sleep(1)
@@ -269,7 +273,7 @@ class Bot:
                     {"path": str(self._collector.screenshot_dir / f"{custom_id}.png")},
                 )
             except BalatroError as e:
-                logger.warning(f"Screenshot failed: {e}")
+                self._logger.warning(f"Screenshot failed: {e}")
 
             self._collector.write_response(
                 id=str(time.time_ns() // 1_000_000),
@@ -340,7 +344,7 @@ class Bot:
         ################################################################################
 
         try:
-            logger.info(f"Executing: {fn_name}({fn_args})")
+            self._logger.info(f"Executing: {fn_name}({fn_args})")
             gamestate = await self._balatro.call(fn_name, fn_args)
 
             self._collector.reset_failures()
@@ -359,7 +363,7 @@ class Bot:
             return await self._handle_failed_call(f"BalatroError: {e}")
 
         except httpx.TransportError as e:
-            logger.warning(f"Game transport error during tool call: {e}")
+            self._logger.warning(f"Game transport error during tool call: {e}")
             self._collector.record_call("failed")
             try:
                 return await self._balatro.call("gamestate")
@@ -372,7 +376,7 @@ class Bot:
         assert self._balatro is not None
         assert self._collector is not None
 
-        logger.warning(f"Error call: {msg}")
+        self._logger.warning(f"Error call: {msg}")
         self._last_error_msg = msg
         self._collector.record_failure()
         self._collector.record_call("error")
@@ -392,7 +396,7 @@ class Bot:
         assert self._balatro is not None
         assert self._collector is not None
 
-        logger.warning(f"Failed call: {msg}")
+        self._logger.warning(f"Failed call: {msg}")
         self._last_failed_msg = msg
         self._collector.record_failure()
         self._collector.record_call("failed")
